@@ -7,14 +7,12 @@ Copyright (c) 2017-2018, NEGORO Tetsuya (https://github.com/ngr-t)
 import re
 from collections import defaultdict
 from datetime import datetime
-from threading import Event, Thread, RLock
 from queue import Empty, Queue
+from threading import Event, RLock, Thread
 
 import sublime
 
-from .utils import show_password_input
-from .utils import get_png_dimensions
-
+from .utils import get_cell, get_png_dimensions, show_password_input
 
 JUPYTER_PROTOCOL_VERSION = "5.0"
 
@@ -149,6 +147,7 @@ class KernelConnection(object):
         def run(self):
             """Run main routine."""
             # TODO: log, handle other message types.
+
             while not self.exit.is_set():
                 try:
                     msg = self._kernel.client.get_iopub_msg(timeout=1)
@@ -159,12 +158,17 @@ class KernelConnection(object):
                     view, region = self._kernel.id2region.get(
                         msg["parent_header"].get("msg_id", None), (None, None)
                     )
-                    
+
                     if msg_type == MSG_TYPE_STATUS:
                         self._kernel._execution_state = content["execution_state"]
                     elif msg_type == MSG_TYPE_EXECUTE_INPUT:
+                        # if code is executed deleted all phantoms in this region
+                        self._kernel._clear_phantoms_in_region(region, view)
+
                         self._kernel._write_text_to_view("\n\n")
-                        if sublime.load_settings("Helium.sublime-settings").get("output_code"):
+                        if sublime.load_settings("Helium.sublime-settings").get(
+                            "output_code"
+                        ):
                             self._kernel._output_input_code(
                                 content["code"], content["execution_count"]
                             )
@@ -189,6 +193,7 @@ class KernelConnection(object):
                         self._kernel._handle_stream(
                             content["name"], content["text"], region, view,
                         )
+
                 except Empty:
                     pass
                 except Exception as ex:
@@ -241,7 +246,7 @@ class KernelConnection(object):
     ):
         """Initialize KernelConnection class.
 
-        paramters
+        parameters
         ---------
         kernel_id str: kernel ID
         parent parent kernel manager
@@ -258,6 +263,7 @@ class KernelConnection(object):
         self._connection_name = connection_name
         self._execution_state = "unknown"
         self._init_receivers()
+        self.phantoms = {}
 
     def __del__(self):  # noqa
         self._shell_msg_receiver.shutdown()
@@ -355,9 +361,7 @@ class KernelConnection(object):
         try:
             lines = """\nError: {ename}, {evalue}.
             \nTraceback:\n{traceback}""".format(
-                ename=ename,
-                evalue=evalue,
-                traceback="\n".join(traceback),
+                ename=ename, evalue=evalue, traceback="\n".join(traceback),
             )
             lines = remove_ansi_escape(lines)
             self._write_text_to_view(lines)
@@ -387,7 +391,7 @@ class KernelConnection(object):
             pass
 
     def _write_out_execution_count(self, execution_count) -> None:
-        self._write_text_to_view("\nOut[{}]: ".format(execution_count))
+        self._write_text_to_view("\nOut[{}]: \n".format(execution_count))
 
     def _write_text_to_view(self, text: str) -> None:
         if self._show_inline_output:
@@ -416,14 +420,18 @@ class KernelConnection(object):
     ):
         if self._show_inline_output:
             id = HELIUM_FIGURE_PHANTOMS + datetime.now().isoformat()
+
             html = TEXT_PHANTOM.format(content=content)
-            view.add_phantom(
+            int_id = view.add_phantom(
                 id,
                 region,
                 html,
                 sublime.LAYOUT_BLOCK,
-                on_navigate=lambda href, id=id: view.erase_phantoms(id),
+                on_navigate=lambda href, id=id, view=view: self._erase_phantom(
+                    id, view=view
+                ),
             )
+            self.phantoms[id] = int_id
             self._logger.info("Created inline phantom {}".format(html))
 
     def _write_inline_image_phantom(
@@ -431,28 +439,59 @@ class KernelConnection(object):
     ):
         if self._show_inline_output:
             id = HELIUM_FIGURE_PHANTOMS + datetime.now().isoformat()
+            img_size = sublime.load_settings("Helium.sublime-settings").get(
+                "image_size", "optimal"
+            )
 
             width = view.viewport_extent()[0] - 2
             dimensions = get_png_dimensions(data)
-            scale_factor = width / dimensions[0]
-            height = dimensions[1] * scale_factor
-            
-            html = IMAGE_PHANTOM.format(data=data, width=width, height=height)
 
-            view.add_phantom(
+            if img_size == "original" or (
+                img_size == "optimal" and (dimensions[0] < width)
+            ):
+                html = IMAGE_PHANTOM.format(
+                    data=data, width=dimensions[0], height=dimensions[1]
+                )
+            else:
+                scale_factor = width / dimensions[0]
+                height = dimensions[1] * scale_factor
+
+                html = IMAGE_PHANTOM.format(data=data, width=width, height=height)
+
+            int_id = view.add_phantom(
                 id,
                 region,
                 html,
                 sublime.LAYOUT_BLOCK,
-                on_navigate=lambda href, id=id: view.erase_phantoms(id),
+                on_navigate=lambda href, id=id, view=view: self._erase_phantom(
+                    id, view=view
+                ),
             )
+            self.phantoms[id] = int_id
             self._logger.info("Created inline phantom image")
+
+    def _clear_phantoms_in_region(self, region: sublime.Region, view: sublime.View):
+        _, cell = get_cell(view, region, logger="")
+        remove = [
+            pid
+            for pid, int_id in self.phantoms.items()
+            if cell.contains(view.query_phantom(int_id)[0])
+        ]
+
+        for pid in remove:
+            self._erase_phantom(pid, view=view)
+
+    def _erase_phantom(self, pid: str, *, view: sublime.View):
+        if pid in self.phantoms:
+            _ = self.phantoms.pop(pid)
+            view.erase_phantoms(pid)
 
     def _write_mime_data_to_view(
         self, mime_data: dict, region: sublime.Region, view: sublime.View
     ) -> None:
         # Now we use basically text/plain for text type.
         # Jupyter kernels often emits html whom minihtml cannot render.
+
         if "text/plain" in mime_data:
             content = mime_data["text/plain"]
             lines = "\n(display data): {content}".format(content=content)
@@ -472,12 +511,21 @@ class KernelConnection(object):
         if "image/png" in mime_data:
             data = mime_data["image/png"].strip()
 
+            img_size = sublime.load_settings("Helium.sublime-settings").get(
+                "image_size", "optimal"
+            )
+
             self._logger.info(self.get_view().viewport_extent())
             width = self.get_view().viewport_extent()[0] - 2
             dimensions = get_png_dimensions(data)
 
-            scale_factor = width / dimensions[0]
-            height = dimensions[1] * scale_factor
+            if img_size == "original" or (
+                img_size == "optimal" and (dimensions[0] < width)
+            ):
+                width, height = dimensions
+            else:
+                scale_factor = width / dimensions[0]
+                height = dimensions[1] * scale_factor
 
             content = (
                 '<body style="background-color:white">'
@@ -534,7 +582,7 @@ class KernelConnection(object):
         msg_id = self.client.execute(code)
         self.id2region[msg_id] = (
             view,
-            sublime.Region(phantom_region.end()-1, phantom_region.end()-1),
+            sublime.Region(phantom_region.end() - 1, phantom_region.end() - 1),
         )
         info_message = "Kernel executed code ```{code}```.".format(code=code)
         self._logger.info(info_message)
